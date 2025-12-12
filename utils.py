@@ -1,7 +1,7 @@
 import networkx as nx
 import numpy as np
+import pandas as pd
 import polars as pl
-import csv
 
 
 class SocialGraph:
@@ -11,28 +11,22 @@ class SocialGraph:
         self.individuals: set[str] = set()
     
     def build(self, limit: int = 0):
-        if not hasattr(self, 'individuals') or self.individuals is None:
-            self.individuals = set()
+        # Read CSV with pandas for use with networkx.from_pandas_edgelist
+        df = pd.read_csv(self.source_file)
         
-        with open(self.source_file, 'r') as f:
-            reader = csv.reader(f)
-            next(reader)  # Skip header row
-            
-            for counter,row in enumerate(reader):
-                user_a, user_b = row[0], row[1]
-                
-                if user_a not in self.graph:
-                    self.graph.add_node(user_a)
-                    self.individuals.add(user_a)
-                
-                if user_b not in self.graph:
-                    self.graph.add_node(user_b)
-                    self.individuals.add(user_b)
-                
-                self.graph.add_edge(user_a, user_b)
-
-                if counter > limit:
-                    break
+        if limit > 0:
+            df = df.head(limit)
+        
+        # Use networkx.from_pandas_edgelist to create graph directly
+        self.graph = nx.from_pandas_edgelist(
+            df, 
+            source='user_a', 
+            target='user_b', 
+            create_using=nx.Graph()
+        )
+        
+        # Update individuals set with all nodes from the graph
+        self.individuals.update(self.graph.nodes())
 
 
 
