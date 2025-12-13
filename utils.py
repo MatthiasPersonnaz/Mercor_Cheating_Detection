@@ -54,29 +54,58 @@ def parse_range_string(range_str: str) -> Tuple[int, int]:
         raise ValueError(f"Could not parse range '{range_str}': {e}")
 
 
-
 FEATURE_TYPING = {
-    "feature_001": pl.Enum,
-    "feature_002": pl.Int8,
-    "feature_003": pl.Int8,
-    "feature_004": pl.Int8,
-    "feature_005": pl.Int8,
-    "feature_006": pl.Int8,
-    "feature_007": pl.Boolean,
-    "feature_008": pl.Int8,
-    "feature_009": pl.Int8,
-    "feature_010": pl.Float32,
-    "feature_011": pl.Boolean,
-    "feature_012": pl.Enum,
-    "feature_013": pl.Boolean,
-    "feature_014": pl.Boolean,
-    "feature_015": pl.Float32,
-    "feature_016": pl.Float32,
-    "feature_017": pl.Float32,
-    "feature_018": pl.Float32,
-    "high_conf_clean": pl.Boolean,
-    "is_cheating": pl.Boolean
+    "feature_001": "categorical",
+    "feature_002": "integer",
+    "feature_003": "integer",
+    "feature_004": "integer",
+    "feature_005": "integer",
+    "feature_006": "integer",
+    "feature_007": "boolean",
+    "feature_008": "integer",
+    "feature_009": "integer",
+    "feature_010": "float",
+    "feature_011": "boolean",
+    "feature_012": "categorical",
+    "feature_013": "boolean",
+    "feature_014": "boolean",
+    "feature_015": "float",
+    "feature_016": "float",
+    "feature_017": "float",
+    "feature_018": "float",
+    "high_conf_clean": "boolean",
+    "is_cheating": "boolean",
 }
+
+
+def get_columns_of_type(dataframe: pl.DataFrame, dtype: str):
+    return list(
+        set(dataframe.columns).intersection(
+            set(col_name for col_name, col_typ in FEATURE_TYPING.items() if col_typ == dtype)
+        )
+    )
+
+
+def cast_dataframe_columns(dataframe: pl.DataFrame) -> pl.DataFrame:
+    # Intersect available columns of the dataframe from all known types
+    boolean_cols = get_columns_of_type(dataframe, "boolean")
+    categorical_cols = get_columns_of_type(dataframe, "categorical")
+    integer_cols = get_columns_of_type(dataframe, "integer")
+    float_cols = get_columns_of_type(dataframe, "float")
+
+    # batch recast columns with proper data type handling
+    dataframe = dataframe.with_columns(
+        pl.col(boolean_cols).cast(pl.Boolean).fill_null(False),
+        pl.col(categorical_cols)
+        .cast(pl.Int8)
+        .cast(pl.Utf8)
+        .fill_null("missing")
+        .cast(pl.Categorical),
+        pl.col(integer_cols).cast(pl.Int8).fill_null(strategy="min"),
+        pl.col(float_cols).cast(pl.Float32).fill_null(strategy="mean"),
+    )
+    return dataframe
+
 
 class CandidateDataset:
     def __init__(self, source_train: str, source_test: str, source_feature_data: str):
@@ -87,7 +116,6 @@ class CandidateDataset:
         self.candidates: set[str] = set()
         self.df_train: pl.DataFrame = pl.DataFrame()
         self.df_test: pl.DataFrame = pl.DataFrame()
-
 
     def display_feature_data(self):
         with open(self.source_feature_map, "r") as json_data:
@@ -100,12 +128,12 @@ class CandidateDataset:
             detected_min_val = self.df_train[feature_name].min()
             nb_unique_values = self.df_train[feature_name].unique().count()
             print(f"  Detected range: [{detected_min_val}, {detected_max_val}]")
-            
+
             if feature_datum is None:
                 print("  No feature metadata provided")
 
             if feature_datum is not None:
-                given_type = feature_datum['type']
+                given_type = feature_datum["type"]
                 given_range = feature_datum["range"]
                 given_min_val, given_max_val = parse_range_string(given_range)
                 nb_range_values = given_max_val - given_min_val + 1
@@ -115,13 +143,15 @@ class CandidateDataset:
                 if feature_datum["type"] == "numeric":
                     print(f"  Range is given: [{given_min_val}, {given_max_val}]")
 
-
                 if given_min_val >= 0 and given_max_val <= 255:
                     print("  Could be made pl.Int8 because positive <= 255")
-                print(f"There are {nb_unique_values} unique values in the train dataset")
+                print(
+                    f"There are {nb_unique_values} unique values in the train dataset"
+                )
                 if nb_unique_values <= nb_range_values and detected_max_val <= 10:
-                    print("  Could be made categorical as (Unique values) <= (Range discrete values)")
-
+                    print(
+                        "  Could be made categorical as (Unique values) <= (Range discrete values)"
+                    )
 
     def build_datasets(self, limit: Optional[int] = None):
         self.df_train = pl.read_csv(
@@ -143,49 +173,5 @@ class CandidateDataset:
 
     def apply_feature_typing(self):
         print("Applying feature types to datasets...")
-
-        def cast_expr(col_name, target_type, df):
-            """Create casting expression with optional enum category detection"""
-            if target_type == pl.Categorical:
-                # For categorical columns: numeric → string → categorical
-                return pl.col(col_name).cast(pl.Utf8).cast(pl.Categorical).alias(col_name)
-            elif target_type == pl.Enum:
-                # For enum columns: detect categories from unique values, then create enum
-                categories = df[col_name].unique().sort().to_list()
-                enum_dtype = pl.Enum(categories)
-                return pl.col(col_name).cast(pl.Utf8).cast(enum_dtype).alias(col_name)
-            else:
-                return pl.col(col_name).cast(target_type).alias(col_name)
-
-        # Apply to train dataset - only columns that exist
-        train_exprs = [
-            cast_expr(col, typ, self.df_train) 
-            for col, typ in FEATURE_TYPING.items() 
-            if col in self.df_train.columns
-        ]
-        if train_exprs:
-            self.df_train = self.df_train.with_columns(train_exprs)
-            print(f"Recast {len(train_exprs)} columns in train dataset")
-
-        # Apply to test dataset - only columns that exist (safely handles missing target columns)
-        test_exprs = [
-            cast_expr(col, typ, self.df_test) 
-            for col, typ in FEATURE_TYPING.items() 
-            if col in self.df_test.columns
-        ]
-        if test_exprs:
-            self.df_test = self.df_test.with_columns(test_exprs)
-            print(f"Recast {len(test_exprs)} columns in test dataset")
-        
-        # Report any columns that were skipped
-        train_columns = set(self.df_train.columns)
-        test_columns = set(self.df_test.columns)
-        feature_columns = set(FEATURE_TYPING.keys())
-        
-        missing_in_train = feature_columns - train_columns
-        missing_in_test = feature_columns - test_columns
-        
-        if missing_in_train:
-            print(f"Note: Columns not found in train dataset: {missing_in_train}")
-        if missing_in_test:
-            print(f"Note: Columns not found in test dataset: {missing_in_test}")
+        self.df_train = cast_dataframe_columns(self.df_train)
+        self.df_test = cast_dataframe_columns(self.df_test)
