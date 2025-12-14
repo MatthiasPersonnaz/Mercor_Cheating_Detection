@@ -1,10 +1,12 @@
+import json
+import re
+from typing import Optional, Tuple
+
 import networkx as nx
 import numpy as np
 import pandas as pd
 import polars as pl
-from typing import Optional, Tuple
-import json
-import re
+import polars.selectors as cs
 
 
 class SocialGraph:
@@ -81,9 +83,31 @@ FEATURE_TYPING = {
 def get_columns_of_type(dataframe: pl.DataFrame, dtype: str):
     return list(
         set(dataframe.columns).intersection(
-            set(col_name for col_name, col_typ in FEATURE_TYPING.items() if col_typ == dtype)
+            set(
+                col_name
+                for col_name, col_typ in FEATURE_TYPING.items()
+                if col_typ == dtype
+            )
         )
     )
+
+
+def safe_dummy_encode(df: pl.DataFrame) -> pl.DataFrame:
+    categorical_cols = df.select(cs.categorical()).columns
+
+    if not categorical_cols:
+        return df
+
+    dummies_df = (
+        df.select(categorical_cols)
+        .cast(pl.Utf8)
+        .to_dummies(separator=":")
+        .cast(pl.Boolean)
+    )
+    dummies_df = dummies_df.select(pl.all().exclude("^.*:missing$"))
+    result_df = df.drop(categorical_cols).hstack(dummies_df)
+
+    return result_df
 
 
 def cast_dataframe_columns(dataframe: pl.DataFrame) -> pl.DataFrame:
@@ -99,7 +123,9 @@ def cast_dataframe_columns(dataframe: pl.DataFrame) -> pl.DataFrame:
         pl.col(categorical_cols)
         .cast(pl.Int8)
         .cast(pl.Utf8)
-        .fill_null("missing")
+        .fill_null(
+            "missing"
+        )  # to make it sort before 0 in order for drop_first to work as intended
         .cast(pl.Categorical),
         pl.col(integer_cols).cast(pl.Int8).fill_null(strategy="min"),
         pl.col(float_cols).cast(pl.Float32).fill_null(strategy="mean"),
@@ -154,12 +180,26 @@ class CandidateDataset:
                     )
 
     def build_datasets(self, limit: Optional[int] = None):
-        self.df_train = pl.read_csv(
-            self.source_train, n_rows=limit, n_threads=4, has_header=True
-        )
-        self.df_test = pl.read_csv(
-            self.source_test, n_rows=limit, n_threads=4, has_header=True
-        )
+        def import_helper(csv_source_path):
+            return (
+                pl.read_csv(
+                    csv_source_path,
+                    n_rows=limit,
+                    n_threads=4,
+                    has_header=True,
+                    row_index_name=None,
+                )
+                .with_columns(
+                    pl.col("user_hash").map_elements(
+                        lambda x: int(x, 16), return_dtype=pl.UInt64
+                    )
+                )
+                .rename({"user_hash": "ID"})
+            )
+
+        self.df_train = import_helper(self.source_train)
+        self.df_test = import_helper(self.source_test)
+
         print(
             f"Imported train dataset with {self.df_train.height} entries ({self.df_train.select(pl.any_horizontal(pl.all().is_null())).sum().item()} of which have missing features)"
         )
@@ -168,10 +208,14 @@ class CandidateDataset:
         )
 
         self.candidates.clear()
-        self.candidates.update(self.df_train["user_hash"].unique().to_list())
-        self.candidates.update(self.df_test["user_hash"].unique().to_list())
+        self.candidates.update(self.df_train["ID"].unique().to_list())
+        self.candidates.update(self.df_test["ID"].unique().to_list())
 
     def apply_feature_typing(self):
         print("Applying feature types to datasets...")
         self.df_train = cast_dataframe_columns(self.df_train)
         self.df_test = cast_dataframe_columns(self.df_test)
+
+    def dummy_encode_categorical(self):
+        self.df_train = safe_dummy_encode(self.df_train)
+        self.df_test = safe_dummy_encode(self.df_test)
