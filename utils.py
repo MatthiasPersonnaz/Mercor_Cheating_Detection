@@ -1,59 +1,55 @@
 import json
+import os
 import re
 from typing import Optional, Tuple
 
 import networkx as nx
 import numpy as np
 import pandas as pd
+import pandera as pa
 import polars as pl
 import polars.selectors as cs
+from pandera.polars import Check, Column, DataFrameSchema
 
 
 class SocialGraph:
     def __init__(self, source_file: str):
+        assert os.path.isfile(source_file)
         self.source_file = source_file
         self.graph: nx.Graph = nx.Graph()
-        self.individuals: set[str] = set()
+        self.candidate_ids: set[int] = set()
+        self.df_edges: pl.DataFrame = pl.DataFrame()
 
     def build(self, limit: int = 0):
-        df_polars = pl.read_csv(
+        df_edges = pl.read_csv(
             self.source_file, n_rows=limit, n_threads=4, use_pyarrow=True
         )
 
-        df_pandas = df_polars.to_pandas(use_pyarrow_extension_array=True)
+        schema = DataFrameSchema(
+            {
+                "user_a": Column(str, nullable=False),
+                "user_b": Column(str, nullable=False),
+            }
+        )
+        schema.validate(df_edges)
+
+
+        df_edges = df_edges.with_columns(
+            pl.col(["user_a", "user_b"]).map_elements(
+                lambda x: int(x, 16), return_dtype=pl.UInt64
+            )
+        ).rename({"user_a": "ID_A", "user_b": "ID_B"})
 
         self.graph = nx.from_pandas_edgelist(
-            df_pandas, source="user_a", target="user_b", create_using=nx.Graph()
+            df_edges, source="ID_A", target="ID_B", create_using=nx.Graph()
         )
+        
+        self.df_edges = df_edges
+        self.candidate_ids.update(self.graph.nodes())
 
-        self.individuals.update(self.graph.nodes())
-
-        print(f"Successfully built social graph with {len(self.graph.nodes)} nodes.")
-
-
-def parse_range_string(range_str: str) -> Tuple[int, int]:
-    """
-    Parse range strings like "1-7" or "-8-100" where the second minus is the separator.
-    Returns a tuple of (min_value, max_value) as integers.
-
-    Examples:
-        "1-7" -> (1, 7)
-        "-8-100" -> (-8, 100)
-        "5-15" -> (5, 15)
-        "-10--5" -> (-10, -5)
-    """
-    # Use regex to find the pattern: optional minus, digits, minus, optional minus, digits
-    match = re.match(r"^(-?\d+)-(-?\d+)$", range_str)
-
-    if not match:
-        raise ValueError(f"Invalid range format: {range_str}")
-
-    try:
-        min_val = int(match.group(1))
-        max_val = int(match.group(2))
-        return (min_val, max_val)
-    except ValueError as e:
-        raise ValueError(f"Could not parse range '{range_str}': {e}")
+        print(
+            f"Successfully built & validated social graph with {len(self.graph.nodes)} nodes."
+        )
 
 
 FEATURE_TYPING = {
@@ -133,15 +129,68 @@ def cast_dataframe_columns(dataframe: pl.DataFrame) -> pl.DataFrame:
     return dataframe
 
 
+def parse_range_string(range_str: str) -> Tuple[int, int]:
+    """
+    Parse range strings like "1-7" or "-8-100" where the second minus is the separator.
+    Returns a tuple of (min_value, max_value) as integers.
+
+    Examples:
+        "1-7" -> (1, 7)
+        "-8-100" -> (-8, 100)
+        "5-15" -> (5, 15)
+        "-10--5" -> (-10, -5)
+    """
+    # Use regex to find the pattern: optional minus, digits, minus, optional minus, digits
+    match = re.match(r"^(-?\d+)-(-?\d+)$", range_str)
+
+    if not match:
+        raise ValueError(f"Invalid range format: {range_str}")
+
+    try:
+        min_val = int(match.group(1))
+        max_val = int(match.group(2))
+        return (min_val, max_val)
+    except ValueError as e:
+        raise ValueError(f"Could not parse range '{range_str}': {e}")
+
+
+def generate_schema_from_metadata(json_path: str) -> DataFrameSchema:
+    with open(json_path) as f:
+        meta = json.load(f)
+
+    columns = {"user_hash": Column(str, nullable=False)}
+
+    for name, spec in meta.items():
+        given_min, given_max = parse_range_string(spec["range"])
+        nullable = spec["missing_%"] > 0.0
+
+        if spec["type"] == "binary":
+            col = Column(float, Check.isin([0.0, 1.0]), nullable=nullable)
+        elif spec["type"] == "float":
+            col = Column(float, Check.between(given_min, given_max), nullable=nullable)
+        elif spec["type"] == "int":
+            col = Column(int, Check.between(given_min, given_max), nullable=nullable)
+
+        columns[name] = col
+
+    return DataFrameSchema(columns)
+
+
 class CandidateDataset:
     def __init__(self, source_train: str, source_test: str, source_feature_data: str):
+        assert os.path.isfile(source_train)
+        assert os.path.isfile(source_test)
+        assert os.path.isfile(source_feature_data)
+
         self.source_train: str = source_train
         self.source_test: str = source_test
         self.source_feature_map = source_feature_data
 
-        self.candidates: set[str] = set()
+        self.candidate_ids: set[int] = set()
         self.df_train: pl.DataFrame = pl.DataFrame()
         self.df_test: pl.DataFrame = pl.DataFrame()
+
+        print("Successfully instanciated Candidate Dataset")
 
     def display_feature_data(self):
         with open(self.source_feature_map, "r") as json_data:
@@ -179,26 +228,35 @@ class CandidateDataset:
                         "  Could be made categorical as (Unique values) <= (Range discrete values)"
                     )
 
-    def build_datasets(self, limit: Optional[int] = None):
-        def import_helper(csv_source_path):
-            return (
-                pl.read_csv(
-                    csv_source_path,
-                    n_rows=limit,
-                    n_threads=4,
-                    has_header=True,
-                    row_index_name=None,
-                )
-                .with_columns(
-                    pl.col("user_hash").map_elements(
-                        lambda x: int(x, 16), return_dtype=pl.UInt64
-                    )
-                )
-                .rename({"user_hash": "ID"})
-            )
+    def import_and_validate_dataset(
+        self, csv_source_path, limit: int, schema: DataFrameSchema
+    ):
+        dataframe: pl.DataFrame = pl.read_csv(
+            csv_source_path,
+            n_rows=limit,
+            n_threads=4,
+            has_header=True,
+            row_index_name=None,
+        )
+        schema.validate(dataframe)
 
-        self.df_train = import_helper(self.source_train)
-        self.df_test = import_helper(self.source_test)
+        dataframe = dataframe.with_columns(
+            pl.col("user_hash").map_elements(
+                lambda x: int(x, 16), return_dtype=pl.UInt64
+            )
+        ).rename({"user_hash": "ID"})
+
+        return dataframe
+
+    def build_datasets(self, limit: Optional[int] = None):
+        schema = generate_schema_from_metadata(self.source_feature_map)
+
+        self.df_train = self.import_and_validate_dataset(
+            self.source_train, limit=limit, schema=schema
+        )
+        self.df_test = self.import_and_validate_dataset(
+            self.source_test, limit=limit, schema=schema
+        )
 
         print(
             f"Imported train dataset with {self.df_train.height} entries ({self.df_train.select(pl.any_horizontal(pl.all().is_null())).sum().item()} of which have missing features)"
@@ -207,9 +265,9 @@ class CandidateDataset:
             f"Imported test dataset with {self.df_test.height} entries ({self.df_test.select(pl.any_horizontal(pl.all().is_null())).sum().item()} of which have missing features)"
         )
 
-        self.candidates.clear()
-        self.candidates.update(self.df_train["ID"].unique().to_list())
-        self.candidates.update(self.df_test["ID"].unique().to_list())
+        self.candidate_ids.clear()
+        self.candidate_ids.update(self.df_train["ID"].unique().to_list())
+        self.candidate_ids.update(self.df_test["ID"].unique().to_list())
 
     def apply_feature_typing(self):
         print("Applying feature types to datasets...")
@@ -219,3 +277,7 @@ class CandidateDataset:
     def dummy_encode_categorical(self):
         self.df_train = safe_dummy_encode(self.df_train)
         self.df_test = safe_dummy_encode(self.df_test)
+
+    def compute_isolate_candidates_from_network(self, network: SocialGraph):
+        difference = self.candidate_ids.difference(network.candidate_ids)
+        print(f"There are {len(difference)} elements in the dataset which are not present in the network.")
