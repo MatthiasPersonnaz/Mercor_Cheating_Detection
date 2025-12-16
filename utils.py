@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import networkx as nx
 import numpy as np
@@ -9,7 +9,9 @@ import pandas as pd
 import pandera as pa
 import polars as pl
 import polars.selectors as cs
+import xgboost as xgb
 from pandera.polars import Check, Column, DataFrameSchema
+from sklearn.model_selection import train_test_split
 
 
 class SocialGraph:
@@ -33,7 +35,6 @@ class SocialGraph:
         )
         schema.validate(df_edges)
 
-
         df_edges = df_edges.with_columns(
             pl.col(["user_a", "user_b"]).map_elements(
                 lambda x: int(x, 16), return_dtype=pl.UInt64
@@ -41,9 +42,12 @@ class SocialGraph:
         ).rename({"user_a": "ID_A", "user_b": "ID_B"})
 
         self.graph = nx.from_pandas_edgelist(
-            df_edges, source="ID_A", target="ID_B", create_using=nx.Graph()
+            df_edges,  # .to_pandas(use_pyarrow_extension_array=True)
+            source="ID_A",
+            target="ID_B",
+            create_using=nx.Graph(),
         )
-        
+
         self.df_edges = df_edges
         self.candidate_ids.update(self.graph.nodes())
 
@@ -52,83 +56,7 @@ class SocialGraph:
         )
 
 
-FEATURE_TYPING = {
-    "feature_001": "categorical",
-    "feature_002": "integer",
-    "feature_003": "integer",
-    "feature_004": "integer",
-    "feature_005": "integer",
-    "feature_006": "integer",
-    "feature_007": "boolean",
-    "feature_008": "integer",
-    "feature_009": "integer",
-    "feature_010": "float",
-    "feature_011": "boolean",
-    "feature_012": "categorical",
-    "feature_013": "boolean",
-    "feature_014": "boolean",
-    "feature_015": "float",
-    "feature_016": "float",
-    "feature_017": "float",
-    "feature_018": "float",
-    "high_conf_clean": "boolean",
-    "is_cheating": "boolean",
-}
-
-
-def get_columns_of_type(dataframe: pl.DataFrame, dtype: str):
-    return list(
-        set(dataframe.columns).intersection(
-            set(
-                col_name
-                for col_name, col_typ in FEATURE_TYPING.items()
-                if col_typ == dtype
-            )
-        )
-    )
-
-
-def safe_dummy_encode(df: pl.DataFrame) -> pl.DataFrame:
-    categorical_cols = df.select(cs.categorical()).columns
-
-    if not categorical_cols:
-        return df
-
-    dummies_df = (
-        df.select(categorical_cols)
-        .cast(pl.Utf8)
-        .to_dummies(separator=":")
-        .cast(pl.Boolean)
-    )
-    dummies_df = dummies_df.select(pl.all().exclude("^.*:missing$"))
-    result_df = df.drop(categorical_cols).hstack(dummies_df)
-
-    return result_df
-
-
-def cast_dataframe_columns(dataframe: pl.DataFrame) -> pl.DataFrame:
-    # Intersect available columns of the dataframe from all known types
-    boolean_cols = get_columns_of_type(dataframe, "boolean")
-    categorical_cols = get_columns_of_type(dataframe, "categorical")
-    integer_cols = get_columns_of_type(dataframe, "integer")
-    float_cols = get_columns_of_type(dataframe, "float")
-
-    # batch recast columns with proper data type handling
-    dataframe = dataframe.with_columns(
-        pl.col(boolean_cols).cast(pl.Boolean).fill_null(False),
-        pl.col(categorical_cols)
-        .cast(pl.Int8)
-        .cast(pl.Utf8)
-        .fill_null(
-            "missing"
-        )  # to make it sort before 0 in order for drop_first to work as intended
-        .cast(pl.Categorical),
-        pl.col(integer_cols).cast(pl.Int8).fill_null(strategy="min"),
-        pl.col(float_cols).cast(pl.Float32).fill_null(strategy="mean"),
-    )
-    return dataframe
-
-
+# TODO: Remove the parsing logic and adapt the feature_metadata_refined.json file to use proper hardcoded ranges
 def parse_range_string(range_str: str) -> Tuple[int, int]:
     """
     Parse range strings like "1-7" or "-8-100" where the second minus is the separator.
@@ -154,21 +82,23 @@ def parse_range_string(range_str: str) -> Tuple[int, int]:
         raise ValueError(f"Could not parse range '{range_str}': {e}")
 
 
-def generate_schema_from_metadata(json_path: str) -> DataFrameSchema:
-    with open(json_path) as f:
-        meta = json.load(f)
-
+def generate_df_schema_from_metadata(
+        feature_metadata: dict[str, dict[str, Any]],
+) -> DataFrameSchema:
+    # Start with user_hash column that is not in the feature metadata file
     columns = {"user_hash": Column(str, nullable=False)}
 
-    for name, spec in meta.items():
+    for name, spec in feature_metadata.items():
+        if spec["to_exclude_in_test"]:
+            continue  # makeshift way to exclude columns that only exist in train set
         given_min, given_max = parse_range_string(spec["range"])
-        nullable = spec["missing_%"] > 0.0
+        nullable = spec["nullable"]
 
-        if spec["type"] == "binary":
+        if spec["schema_type"] == "binary":
             col = Column(float, Check.isin([0.0, 1.0]), nullable=nullable)
-        elif spec["type"] == "float":
+        elif spec["schema_type"] == "float":
             col = Column(float, Check.between(given_min, given_max), nullable=nullable)
-        elif spec["type"] == "int":
+        elif spec["schema_type"] == "int":
             col = Column(int, Check.between(given_min, given_max), nullable=nullable)
 
         columns[name] = col
@@ -189,8 +119,13 @@ class CandidateDataset:
         self.candidate_ids: set[int] = set()
         self.df_train: pl.DataFrame = pl.DataFrame()
         self.df_test: pl.DataFrame = pl.DataFrame()
+        self.df_validation: pl.DataFrame = pl.DataFrame()
+        with open(self.source_feature_map) as f:
+            self.feature_metadata: dict[str, dict[str, Any]] = json.load(f)
 
-        print("Successfully instanciated Candidate Dataset")
+        print(
+            "Successfully instanciated Candidate Dataset and imported feature metadata."
+        )
 
     def display_feature_data(self):
         with open(self.source_feature_map, "r") as json_data:
@@ -228,8 +163,8 @@ class CandidateDataset:
                         "  Could be made categorical as (Unique values) <= (Range discrete values)"
                     )
 
-    def import_and_validate_dataset(
-        self, csv_source_path, limit: int, schema: DataFrameSchema
+    def _import_and_validate_dataset(
+            self, csv_source_path, limit: Optional[int], schema: DataFrameSchema
     ):
         dataframe: pl.DataFrame = pl.read_csv(
             csv_source_path,
@@ -238,25 +173,118 @@ class CandidateDataset:
             has_header=True,
             row_index_name=None,
         )
+
         schema.validate(dataframe)
 
+        return dataframe
+
+    def _transform_user_hash_to_id(self, dataframe: pl.DataFrame) -> pl.DataFrame:
         dataframe = dataframe.with_columns(
             pl.col("user_hash").map_elements(
                 lambda x: int(x, 16), return_dtype=pl.UInt64
             )
         ).rename({"user_hash": "ID"})
-
         return dataframe
 
-    def build_datasets(self, limit: Optional[int] = None):
-        schema = generate_schema_from_metadata(self.source_feature_map)
+    def get_columns_of_target_type(
+            self, dataframe: pl.DataFrame, dtype: str
+    ) -> list[str]:
+        return [
+            feat_name
+            for feat_name in dataframe.columns
+            if feat_name in self.feature_metadata
+               and self.feature_metadata[feat_name]["target_type"] == dtype
+        ]
 
-        self.df_train = self.import_and_validate_dataset(
+    def _cast_columns(self, df: pl.DataFrame) -> pl.DataFrame:
+        # Intersect available columns of the dataframe from all known types
+        boolean_cols = self.get_columns_of_target_type(df, "boolean")
+        categorical_cols = self.get_columns_of_target_type(df, "categorical")
+        integer_cols = self.get_columns_of_target_type(df, "integer")
+        float_cols = self.get_columns_of_target_type(df, "float")
+
+        # batch recast columns with proper data type handling
+        df = df.with_columns(
+            pl.col(boolean_cols).cast(pl.Boolean),
+            pl.col(categorical_cols).cast(pl.Int16).cast(pl.Utf8),  # pl.Categorical?
+            pl.col(integer_cols).cast(pl.Int16),
+            pl.col(float_cols).cast(pl.Float32),
+        )
+        return df
+
+    def _handle_missing_values(self, df: pl.DataFrame) -> pl.DataFrame:
+        # handle the high confidence clean values
+        if "is_cheating" in df.columns:
+            df = df.with_columns(
+                pl.col("is_cheating")
+                .fill_null(
+                    pl.when(pl.col("high_conf_clean"))
+                    .then(pl.lit(False))
+                    # .otherwise(pl.lit(pl.Null, dtype=pl.Boolean))
+                )
+            )
+
+        boolean_cols = self.get_columns_of_target_type(df, "boolean")
+        categorical_cols = self.get_columns_of_target_type(df, "categorical")
+        integer_cols = self.get_columns_of_target_type(df, "integer")
+        float_cols = self.get_columns_of_target_type(df, "float")
+
+        df = df.with_columns(
+            pl.col(boolean_cols).fill_null(False),
+            pl.col(categorical_cols).fill_null("missing"),
+            pl.col(integer_cols).fill_null(strategy="min"),
+            pl.col(float_cols).fill_null(strategy="min"),
+        )
+        return df
+
+    def _encode_dummies(self, df: pl.DataFrame, discard_missing: bool = False) -> pl.DataFrame:
+        categorical_cols = df.select(cs.categorical()).columns
+        categorical_cols = self.get_columns_of_target_type(df, "categorical")
+        if not categorical_cols:
+            return df
+
+        dummies = (
+            df.select(categorical_cols)
+            .to_dummies(separator=":")
+            .cast(pl.Boolean)
+        )
+        if discard_missing:
+            dummies = dummies.select(pl.all().exclude("^.*:missing$"))
+
+        df = df.drop(categorical_cols).hstack(dummies)
+        return df
+
+    def build_pipeline(self, limit: Optional[int] = None, fill_missing: bool = False, encode_categorical: bool = False):
+        schema = generate_df_schema_from_metadata(self.feature_metadata)
+
+        # Import and validate datasets
+        df_train = self._import_and_validate_dataset(
             self.source_train, limit=limit, schema=schema
         )
-        self.df_test = self.import_and_validate_dataset(
+        df_test = self._import_and_validate_dataset(
             self.source_test, limit=limit, schema=schema
         )
+
+        # Transform user_hash to integer ID
+        df_train = self._transform_user_hash_to_id(df_train)
+        df_test = self._transform_user_hash_to_id(df_test)
+
+        # Cast columns to proper types and encode categorical features as dummies
+        df_train = self._cast_columns(df_train)
+        df_test = self._cast_columns(df_test)
+
+        # Handle missing values
+        if fill_missing:
+            df_train = self._handle_missing_values(df_train)
+            df_test = self._handle_missing_values(df_test)
+
+        # Encode categorical features as dummies
+        if encode_categorical:
+            df_train = self._encode_dummies(df_train)
+            df_test = self._encode_dummies(df_test)
+
+        self.df_train = df_train
+        self.df_test = df_test
 
         print(
             f"Imported train dataset with {self.df_train.height} entries ({self.df_train.select(pl.any_horizontal(pl.all().is_null())).sum().item()} of which have missing features)"
@@ -265,19 +293,93 @@ class CandidateDataset:
             f"Imported test dataset with {self.df_test.height} entries ({self.df_test.select(pl.any_horizontal(pl.all().is_null())).sum().item()} of which have missing features)"
         )
 
+    def build_candidate_id_set(self):
         self.candidate_ids.clear()
         self.candidate_ids.update(self.df_train["ID"].unique().to_list())
         self.candidate_ids.update(self.df_test["ID"].unique().to_list())
 
-    def apply_feature_typing(self):
-        print("Applying feature types to datasets...")
-        self.df_train = cast_dataframe_columns(self.df_train)
-        self.df_test = cast_dataframe_columns(self.df_test)
-
-    def dummy_encode_categorical(self):
-        self.df_train = safe_dummy_encode(self.df_train)
-        self.df_test = safe_dummy_encode(self.df_test)
-
     def compute_isolate_candidates_from_network(self, network: SocialGraph):
-        difference = self.candidate_ids.difference(network.candidate_ids)
-        print(f"There are {len(difference)} elements in the dataset which are not present in the network.")
+        diff1 = self.candidate_ids.difference(network.candidate_ids)
+        print(
+            f"There are {len(diff1)} elements in the dataset which are not present in the network."
+        )
+        diff2 = network.candidate_ids.difference(self.candidate_ids)
+        print(
+            f"There are {len(diff2)} elements in the network which are not present in the dataset."
+        )
+
+    def split(
+            self,
+            test_fraction: float = 0.2,
+            seed: int = 42,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """
+        Shuffle a dataframe deterministically and split it into train/test subsets.
+        """
+        shuffled = self.df_train.sample(fraction=1.0, with_replacement=False, seed=seed)
+
+        df_train, df_test = train_test_split(
+            shuffled,
+            test_size=test_fraction,
+            random_state=seed,
+            shuffle=True,
+        )
+
+        print(
+            f"Split dataframe into {df_train.height} training and {df_test.height} validation entries."
+        )
+
+        return df_train, df_test
+
+    def fit_xgboost_model(self, df_train):
+        train_data = df_train.drop("is_cheating")
+        target_data = df_train["is_cheating"]
+
+        dtrain = xgb.DMatrix(train_data, label=target_data)
+
+        params = {
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+            "max_depth": 3,
+            "learning_rate": 0.1,
+            "n_estimators": 100,
+        }
+
+        bst = xgb.train(params, dtrain)
+        print("XGBoost model trained successfully!")
+        return bst
+
+    def evaluate_xgboost_model(self, model, df_eval: pl.DataFrame):
+        """
+        Evaluate a trained XGBoost booster on the provided dataframe using log loss and accuracy.
+        """
+        features = df_eval.drop("is_cheating")
+        labels = df_eval["is_cheating"]
+
+        deval = xgb.DMatrix(features, label=labels)
+        eval_result = model.eval(deval, name="eval")
+
+        metric_values: dict[str, float] = {}
+        for entry in eval_result.strip().split("\t"):
+            entry = entry.strip()
+            if not entry or entry.startswith("[") or ":" not in entry:
+                continue
+            metric, value = entry.split(":", 1)
+            try:
+                metric_values[metric] = float(value)
+            except ValueError:
+                continue
+
+        preds = model.predict(deval)
+        labels_np = labels.to_numpy()
+        accuracy = float(((preds >= 0.5) == labels_np).mean())
+
+        logloss = metric_values.get("eval-logloss")
+        if logloss is not None:
+            print(
+                f"Evaluation metrics -> LogLoss: {logloss:.5f}, Accuracy: {accuracy:.4f}"
+            )
+        else:
+            print(f"Evaluation metrics -> {eval_result}, Accuracy: {accuracy:.4f}")
+
+        return {"logloss": logloss, "accuracy": accuracy, "raw_eval": eval_result}
