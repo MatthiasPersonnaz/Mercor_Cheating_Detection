@@ -3,7 +3,7 @@
     "schema_type": "float",
     "range": "1-5",
     "missing_%": 11.9,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "categorical",
     "to_exclude_in_test": false
   },
@@ -11,7 +11,7 @@
     "schema_type": "float",
     "range": "1-10",
     "missing_%": 11.7,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "integer",
     "to_exclude_in_test": false
   },
@@ -19,7 +19,7 @@
     "schema_type": "float",
     "range": "1-10",
     "missing_%": 11.7,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "integer",
     "to_exclude_in_test": false
   },
@@ -27,7 +27,7 @@
     "schema_type": "float",
     "range": "0-10",
     "missing_%": 0.9,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "integer",
     "to_exclude_in_test": false
   },
@@ -35,7 +35,7 @@
     "schema_type": "float",
     "range": "1-10",
     "missing_%": 2.1,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "integer",
     "to_exclude_in_test": false
   },
@@ -43,7 +43,7 @@
     "schema_type": "float",
     "range": "0-10",
     "missing_%": 0.9,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "integer",
     "to_exclude_in_test": false
   },
@@ -51,7 +51,7 @@
     "schema_type": "binary",
     "range": "0-1",
     "missing_%": 2.6,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "boolean",
     "to_exclude_in_test": false
   },
@@ -59,7 +59,7 @@
     "schema_type": "float",
     "range": "0-10",
     "missing_%": 2.7,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "integer",
     "to_exclude_in_test": false
   },
@@ -67,7 +67,7 @@
     "schema_type": "float",
     "range": "0-10",
     "missing_%": 2.7,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "integer",
     "to_exclude_in_test": false
   },
@@ -75,7 +75,7 @@
     "schema_type": "float",
     "range": "0-39128914",
     "missing_%": 2.7,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "float",
     "to_exclude_in_test": false
   },
@@ -83,7 +83,7 @@
     "schema_type": "binary",
     "range": "0-1",
     "missing_%": 2.6,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "boolean",
     "to_exclude_in_test": false
   },
@@ -91,7 +91,7 @@
     "schema_type": "float",
     "range": "0-3",
     "missing_%": 4.6,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "categorical",
     "to_exclude_in_test": false
   },
@@ -99,7 +99,7 @@
     "schema_type": "binary",
     "range": "0-1",
     "missing_%": 2.6,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "boolean",
     "to_exclude_in_test": false
   },
@@ -107,7 +107,7 @@
     "schema_type": "binary",
     "range": "0-1",
     "missing_%": 2.6,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "boolean",
     "to_exclude_in_test": false
   },
@@ -115,7 +115,7 @@
     "schema_type": "float",
     "range": "-8-898",
     "missing_%": 0.0,
-    "nullable": false,
+    "missing_values": false,
     "target_type": "float",
     "to_exclude_in_test": false
   },
@@ -123,7 +123,7 @@
     "schema_type": "int",
     "range": "0-581",
     "missing_%": 0.0,
-    "nullable": false,
+    "missing_values": false,
     "target_type": "float",
     "to_exclude_in_test": false
   },
@@ -131,7 +131,7 @@
     "schema_type": "float",
     "range": "0-24",
     "missing_%": 10.9,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "float",
     "to_exclude_in_test": false
   },
@@ -139,21 +139,21 @@
     "schema_type": "float",
     "range": "0-1",
     "missing_%": 10.9,
-    "nullable": true,
+    "missing_values": true,
     "target_type": "float",
     "to_exclude_in_test": false
   },
   "high_conf_clean": {
     "schema_type": "float",
     "range": "0-1",
-    "nullable": true,
+    "missing_values": true,
     "target_type": "boolean",
     "to_exclude_in_test": true
   },
   "is_cheating": {
     "schema_type": "float",
     "range": "0-1",
-    "nullable": true,
+    "missing_values": true,
     "target_type": "boolean",
     "to_exclude_in_test": true
   }

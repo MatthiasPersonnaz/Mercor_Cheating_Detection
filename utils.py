@@ -92,7 +92,7 @@ def generate_df_schema_from_metadata(
         if spec["to_exclude_in_test"]:
             continue  # makeshift way to exclude columns that only exist in train set
         given_min, given_max = parse_range_string(spec["range"])
-        nullable = spec["nullable"]
+        nullable = spec["missing_values"]
 
         if spec["schema_type"] == "binary":
             col = Column(float, Check.isin([0.0, 1.0]), nullable=nullable)
@@ -122,6 +122,7 @@ class CandidateDataset:
         self.df_validation: pl.DataFrame = pl.DataFrame()
         with open(self.source_feature_map) as f:
             self.feature_metadata: dict[str, dict[str, Any]] = json.load(f)
+        self.schema: DataFrameSchema = generate_df_schema_from_metadata(self.feature_metadata)
 
         print(
             "Successfully instanciated Candidate Dataset and imported feature metadata."
@@ -164,7 +165,7 @@ class CandidateDataset:
                     )
 
     def _import_and_validate_dataset(
-            self, csv_source_path, limit: Optional[int], schema: DataFrameSchema
+            self, csv_source_path, limit: Optional[int]
     ):
         dataframe: pl.DataFrame = pl.read_csv(
             csv_source_path,
@@ -174,7 +175,7 @@ class CandidateDataset:
             row_index_name=None,
         )
 
-        schema.validate(dataframe)
+        self.schema.validate(dataframe)
 
         return dataframe
 
@@ -224,10 +225,20 @@ class CandidateDataset:
                 )
             )
 
+        # TODO: Add some mechanism to guess the missing values from the graph
+
         boolean_cols = self.get_columns_of_target_type(df, "boolean")
         categorical_cols = self.get_columns_of_target_type(df, "categorical")
         integer_cols = self.get_columns_of_target_type(df, "integer")
         float_cols = self.get_columns_of_target_type(df, "float")
+
+        missing_indicator_exprs = [
+            pl.col(col).is_null().alias(f"{col}:missing")
+            for col in boolean_cols + integer_cols + float_cols if self.feature_metadata[col]["missing_values"]
+        ]
+
+        if missing_indicator_exprs:
+            df = df.with_columns(missing_indicator_exprs)
 
         df = df.with_columns(
             pl.col(boolean_cols).fill_null(False),
@@ -238,7 +249,6 @@ class CandidateDataset:
         return df
 
     def _encode_dummies(self, df: pl.DataFrame, discard_missing: bool = False) -> pl.DataFrame:
-        categorical_cols = df.select(cs.categorical()).columns
         categorical_cols = self.get_columns_of_target_type(df, "categorical")
         if not categorical_cols:
             return df
@@ -254,15 +264,32 @@ class CandidateDataset:
         df = df.drop(categorical_cols).hstack(dummies)
         return df
 
-    def build_pipeline(self, limit: Optional[int] = None, fill_missing: bool = False, encode_categorical: bool = False):
-        schema = generate_df_schema_from_metadata(self.feature_metadata)
+    def _compute_mean_std(self, df) -> dict[str, tuple[float, float]]:
+        integer_cols = self.get_columns_of_target_type(df, "integer")
+        float_cols = self.get_columns_of_target_type(df, "float")
+
+        numerical_cols = integer_cols + float_cols
+        return {col: (df[col].mean(), df[col].std()) for col in numerical_cols}
+
+    def _normalize_columns(self, df: pl.DataFrame, stats_dict: dict[str, tuple[float, float]]):
+
+        df = df.with_columns(
+            [
+                ((pl.col(col).cast(pl.Float32) - mean) / std).alias(col)
+                for (col,(mean, std)) in stats_dict.items()
+            ]
+        )
+        return df
+
+    def build_pipeline(self, limit: Optional[int] = None, fill_missing: bool = False, encode_categorical: bool = False,
+                       normalize_cols: bool = False):
 
         # Import and validate datasets
         df_train = self._import_and_validate_dataset(
-            self.source_train, limit=limit, schema=schema
+            self.source_train, limit=limit
         )
         df_test = self._import_and_validate_dataset(
-            self.source_test, limit=limit, schema=schema
+            self.source_test, limit=limit
         )
 
         # Transform user_hash to integer ID
@@ -282,6 +309,11 @@ class CandidateDataset:
         if encode_categorical:
             df_train = self._encode_dummies(df_train)
             df_test = self._encode_dummies(df_test)
+
+        if normalize_cols:
+            train_stats_dict = self._compute_mean_std(df_train)
+            df_train = self._normalize_columns(df_train, train_stats_dict)
+            df_test = self._normalize_columns(df_test, train_stats_dict)
 
         self.df_train = df_train
         self.df_test = df_test
@@ -331,13 +363,13 @@ class CandidateDataset:
 
         return df_train, df_test
 
-    def fit_xgboost_model(self, df_train):
+    def fit_xgboost_model(self, df_train: pl.DataFrame, params: Optional[dict]) -> xgb.XGBModel:
         train_data = df_train.drop("is_cheating")
         target_data = df_train["is_cheating"]
 
         dtrain = xgb.DMatrix(train_data, label=target_data)
 
-        params = {
+        model_params = params if params is not None else {
             "objective": "binary:logistic",
             "eval_metric": "logloss",
             "max_depth": 3,
@@ -349,7 +381,7 @@ class CandidateDataset:
         print("XGBoost model trained successfully!")
         return bst
 
-    def evaluate_xgboost_model(self, model, df_eval: pl.DataFrame):
+    def evaluate_xgboost_model(self, model, df_eval: pl.DataFrame) -> dict[str, float]:
         """
         Evaluate a trained XGBoost booster on the provided dataframe using log loss and accuracy.
         """
