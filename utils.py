@@ -189,13 +189,13 @@ class CandidateDataset:
 
     def get_columns_of_target_type(
             self, dataframe: pl.DataFrame, dtype: str
-    ) -> list[str]:
-        return [
+    ) -> set[str]:
+        return set([
             feat_name
             for feat_name in dataframe.columns
             if feat_name in self.feature_metadata
                and self.feature_metadata[feat_name]["target_type"] == dtype
-        ]
+        ])
 
     def _cast_columns(self, df: pl.DataFrame) -> pl.DataFrame:
         # Intersect available columns of the dataframe from all known types
@@ -214,7 +214,7 @@ class CandidateDataset:
         return df
 
     def _handle_missing_values(self, df: pl.DataFrame) -> pl.DataFrame:
-        # handle the high confidence clean values
+        # handle is_cheating case based on the high_conf_clean column ONLY IN TRAINING SET
         if "is_cheating" in df.columns:
             df = df.with_columns(
                 pl.col("is_cheating")
@@ -225,16 +225,26 @@ class CandidateDataset:
                 )
             )
 
-        # TODO: Add some mechanism to guess the missing values from the graph
+        # handle the special case of high_conf_clean_clean being False if absent ONLY IN TRAINING SET
+        if "high_conf_clean" in df.columns:
+            df = df.with_columns(
+                pl.col("high_conf_clean")
+                .fill_null(pl.lit(False))
+            )
 
-        boolean_cols = self.get_columns_of_target_type(df, "boolean")
+        # TODO: Add some mechanism to guess the missing values from the graph for the other columns
+
+        boolean_cols = (self.get_columns_of_target_type(df, "boolean")
+                        .difference({"high_conf_clean", "is_cheating"})) # remove the formerly already handled
         categorical_cols = self.get_columns_of_target_type(df, "categorical")
         integer_cols = self.get_columns_of_target_type(df, "integer")
         float_cols = self.get_columns_of_target_type(df, "float")
 
         missing_indicator_exprs = [
+            # categorical columns are handled thereafter in a special way
             pl.col(col).is_null().alias(f"{col}:missing")
-            for col in boolean_cols + integer_cols + float_cols if self.feature_metadata[col]["missing_values"]
+            for col in boolean_cols.union(integer_cols).union(float_cols) if
+            self.feature_metadata[col]["missing_values"]
         ]
 
         if missing_indicator_exprs:
@@ -268,7 +278,7 @@ class CandidateDataset:
         integer_cols = self.get_columns_of_target_type(df, "integer")
         float_cols = self.get_columns_of_target_type(df, "float")
 
-        numerical_cols = integer_cols + float_cols
+        numerical_cols = integer_cols.union(float_cols)
         return {col: (df[col].mean(), df[col].std()) for col in numerical_cols}
 
     def _normalize_columns(self, df: pl.DataFrame, stats_dict: dict[str, tuple[float, float]]):
@@ -276,7 +286,7 @@ class CandidateDataset:
         df = df.with_columns(
             [
                 ((pl.col(col).cast(pl.Float32) - mean) / std).alias(col)
-                for (col,(mean, std)) in stats_dict.items()
+                for (col, (mean, std)) in stats_dict.items()
             ]
         )
         return df
