@@ -3,57 +3,14 @@ import os
 import re
 from typing import Any, Optional, Tuple
 
-import networkx as nx
 import numpy as np
 import pandas as pd
-import pandera as pa
 import polars as pl
 import polars.selectors as cs
 import xgboost as xgb
 from pandera.polars import Check, Column, DataFrameSchema
 from sklearn.model_selection import train_test_split
-
-
-class SocialGraph:
-    def __init__(self, source_file: str):
-        assert os.path.isfile(source_file)
-        self.source_file = source_file
-        self.graph: nx.Graph = nx.Graph()
-        self.candidate_ids: set[int] = set()
-        self.df_edges: pl.DataFrame = pl.DataFrame()
-
-    def build(self, limit: int = 0):
-        df_edges = pl.read_csv(
-            self.source_file, n_rows=limit, n_threads=4, use_pyarrow=True
-        )
-
-        schema = DataFrameSchema(
-            {
-                "user_a": Column(str, nullable=False),
-                "user_b": Column(str, nullable=False),
-            }
-        )
-        schema.validate(df_edges)
-
-        df_edges = df_edges.with_columns(
-            pl.col(["user_a", "user_b"]).map_elements(
-                lambda x: int(x, 16), return_dtype=pl.UInt64
-            )
-        ).rename({"user_a": "ID_A", "user_b": "ID_B"})
-
-        self.graph = nx.from_pandas_edgelist(
-            df_edges,  # .to_pandas(use_pyarrow_extension_array=True)
-            source="ID_A",
-            target="ID_B",
-            create_using=nx.Graph(),
-        )
-
-        self.df_edges = df_edges
-        self.candidate_ids.update(self.graph.nodes())
-
-        print(
-            f"Successfully built & validated social graph with {len(self.graph.nodes)} nodes."
-        )
+from social_graph import SocialGraph
 
 
 # TODO: Remove the parsing logic and adapt the feature_metadata_refined.json file to use proper hardcoded ranges
@@ -104,6 +61,9 @@ def generate_df_schema_from_metadata(
         columns[name] = col
 
     return DataFrameSchema(columns)
+
+
+
 
 
 class CandidateDataset:
