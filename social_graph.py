@@ -8,25 +8,24 @@ import numpy as np
 import polars as pl
 from pandera.polars import Check, Column, DataFrameSchema
 import matplotlib.pyplot as plt
-from networkx.drawing.nx_agraph import graphviz_layout
+from networkx.drawing.nx_agraph import graphviz_layout, write_dot
 from polars import DataFrame
 import scipy
 from sklearn.manifold import SpectralEmbedding
 import tqdm
 from itertools import combinations
 
+
 class SocialGraph:
     def __init__(self, source_file: str):
         self.communities: list[int] = []
         assert os.path.isfile(source_file)
-        self.source_file = source_file
+        self.source_file: str = source_file
         self.graph: nx.Graph = nx.Graph()
         self.candidate_ids: set[int] = set()
         self.df_edges: pl.DataFrame = pl.DataFrame()
 
-    def build(
-            self, limit: Optional[int] = None, database_nodes_subset: Optional[set[int]] = None
-    ):
+    def build_from_edges(self, limit: Optional[int] = None):
         df_edges = pl.read_csv(
             self.source_file, n_rows=limit, n_threads=4, use_pyarrow=True
         )
@@ -45,61 +44,40 @@ class SocialGraph:
             )
         ).rename({"user_a": "ID_A", "user_b": "ID_B"})
 
-        graph = nx.from_pandas_edgelist(
+        complete_social_graph = nx.from_pandas_edgelist(
             df_edges,
             source="ID_A",
             target="ID_B",
             create_using=nx.Graph(),
         )
-        print("Graph loaded successfully")
-        print("Number of nodes:", len(graph.nodes()))
-        print("Number of edges:", len(graph.edges()))
 
-        # contract here
-        if database_nodes_subset is not None:
-            print("Beginning pruning...")
-            nodes_to_keep = set(graph.nodes()).intersection(database_nodes_subset)
-
-            contracted_graph = nx.Graph()
-            contracted_graph.add_nodes_from(nodes_to_keep)
-            connected_components = nx.connected_components(graph)
-            for idx, component in enumerate(connected_components):
-                comp_nodes = nodes_to_keep.intersection(component)
-                if len(comp_nodes) <= 2:
-                    continue
-
-                subgraph = graph.subgraph(component)
-
-                # multi-source BFS from each kept node, restricted to component
-                # visited = set()
-                #
-                lengths_generator = nx.all_pairs_shortest_path_length(subgraph, backend="cugraph")
-
-                keep = nodes_to_keep  # already a set
-                add_edge = contracted_graph.add_edge
-
-                for u, dist_dict in tqdm.tqdm(lengths_generator):
-                    if u not in keep:
-                        continue
-
-                    # local bindings (critical for speed)
-                    u_local = u
-                    for v, d in dist_dict.items():
-                        if v in keep and v > u_local:
-                            add_edge(u_local, v, weight=d)
-                # print(f"There are {len(edges)} edges in component {idx} of size {len(comp_nodes)}")
-
-                contracted_graph.add_edges_from()
-                graph = contracted_graph
-
-        self.graph = graph
+        self.graph = complete_social_graph
         self.df_edges = df_edges
         self.candidate_ids.update(self.graph.nodes())
         self.communities = [c for c in sorted(nx.connected_components(self.graph), key=len, reverse=True)]
 
-        print(
-            f"Successfully built & validated social graph with {len(self.graph.nodes)} nodes."
-        )
+        print("Built graph successfully")
+        print("Number of nodes:", len(self.graph.nodes()))
+        print("Number of edges:", len(self.graph.edges()))
+
+    def prune_from_datasets(self, dataset_train: DataFrame, dataset_test: DataFrame):
+        train_nodes = set(dataset_train["ID"].unique().to_list())
+        test_nodes = set(dataset_test["ID"].unique().to_list())
+        dataset_nodes = train_nodes | test_nodes
+        # complete_graph_nodes = set(self.graph.nodes())
+
+        print("Beginning pruning...")
+
+        for component in tqdm.tqdm(self.communities):
+            nodes_deg_1 = {u for u in component if self.graph.degree(u) == 1}
+            uninformative_nodes = nodes_deg_1.difference(dataset_nodes) # nodes that do not appear in the dataset, to discard
+            self.graph.remove_nodes_from(uninformative_nodes)
+
+        # update communities
+        self.communities = [c for c in sorted(nx.connected_components(self.graph), key=len, reverse=True)]
+        print("Pruned graph successfully")
+        print("Number of nodes:", len(self.graph.nodes()))
+        print("Number of edges:", len(self.graph.edges()))
 
     def get_subgraph_view(self, comm_idx: int):
         return nx.induced_subgraph(self.graph, self.communities[comm_idx])
@@ -136,7 +114,7 @@ class SocialGraph:
         embeddings = spectral_embedder.fit_transform(adj_mat.toarray())
         return embeddings
 
-    def plot_subgraph_view_by_datasets(
+    def plot_subgraph_dataset_labels(
             self, community_idx: int, dataset_train: DataFrame, dataset_test: DataFrame
     ):
         subgraph = self.get_subgraph_view(community_idx)
@@ -178,7 +156,57 @@ class SocialGraph:
         )
         plt.show()
 
-    def plot_subgraph_view_by_network(self, community_idx: int):
+    def export_subgraph_dataset_labels_dot(
+            self,
+            community_idx: int,
+            dataset_train: DataFrame,
+            dataset_test: DataFrame,
+            output_path: str,
+            show_node_ids: bool = False,
+            node_diameter_inches: float = 0.15,
+    ):
+        subgraph = self.get_subgraph_view(community_idx)
+        if subgraph.number_of_nodes() == 0:
+            raise ValueError(f"Community index {community_idx} has no nodes to export.")
+
+        node_fill_colors = {}
+
+        for node in subgraph.nodes():
+            found_in_train = dataset_train.filter(pl.col("ID") == node)
+            found_in_test = dataset_test.filter(pl.col("ID") == node)
+
+            if not found_in_train.is_empty():
+                is_cheating = False
+                if not found_in_train.is_empty():
+                    is_cheating = bool(found_in_train["is_cheating"][0])
+                node_fill_colors[node] = "red" if is_cheating else "green"
+            elif not found_in_test.is_empty():
+                node_fill_colors[node] = "yellow"
+            else:
+                node_fill_colors[node] = "blue"
+
+        # Avoid mutating the cached subgraph.
+        export_graph = nx.Graph(subgraph)
+        node_attributes = {}
+        for node, color in node_fill_colors.items():
+            node_attributes[node] = {
+                "fillcolor": color,
+                "style": "filled",
+                "label": str(node) if show_node_ids else "",
+                "shape": "circle",
+                "fixedsize": "true",
+                "width": node_diameter_inches,
+                "height": node_diameter_inches,
+            }
+
+        nx.set_node_attributes(export_graph, node_attributes)
+
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        write_dot(export_graph, output_path)
+
+    def plot_subgraph_spectral_structure(self, community_idx: int):
         # TODO:
         subgraph = self.get_subgraph_view(community_idx)
         if subgraph.number_of_nodes() == 0:
