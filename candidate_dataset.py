@@ -242,6 +242,17 @@ class CandidateDataset:
         return {col: (df[col].mean(), df[col].std()) for col in numerical_cols}
 
     def _normalize_columns(self, df: pl.DataFrame, stats_dict: dict[str, tuple[float, float]]):
+        def signed_log_transform(expr: pl.Expr, eps) -> pl.Expr:
+            return (
+                pl.when(expr == 0)
+                .then(0.0)
+                .otherwise(expr.sign() * (expr.abs() + eps).log10())
+            )
+
+        cols = ["feature_015", "feature_016"]
+        df = df.with_columns(
+            [signed_log_transform(pl.col(c), .5).alias(c) for c in cols]
+        )
 
         df = df.with_columns(
             [
@@ -250,6 +261,9 @@ class CandidateDataset:
             ]
         )
         return df
+
+    def _enrich_features(self, ):
+        pass
 
     def build_pipeline(self, limit: Optional[int] = None, fill_missing: bool = False, encode_categorical: bool = False,
                        normalize_cols: bool = False):
@@ -318,45 +332,37 @@ class CandidateDataset:
         """
         Shuffle a dataframe deterministically and split it into train/test subsets.
         """
-        shuffled = self.df_train.sample(fraction=1.0, with_replacement=False, seed=seed)
 
-        df_train, df_test = train_test_split(
-            shuffled,
+        daata_train, data_val = train_test_split(
+            self.df_train,
             test_size=test_fraction,
             random_state=seed,
             shuffle=True,
+            stratify=self.df_train["is_cheating"]
         )
 
         print(
-            f"Split dataframe into {df_train.height} training and {df_test.height} validation entries."
+            f"Split dataframe into {daata_train.height} training and {data_val.height} validation entries."
         )
 
-        return df_train, df_test
+        return daata_train, data_val
 
-    def fit_xgboost_model(self, df_train: pl.DataFrame, params: Optional[dict]) -> xgb.XGBModel:
-        train_data = df_train.drop("is_cheating")
-        target_data = df_train["is_cheating"]
+    def fit_xgboost_model(self, data_train: pl.DataFrame, params: dict) -> xgb.XGBModel:
+        train_data = data_train.drop("is_cheating")
+        target_data = data_train["is_cheating"]
 
         dtrain = xgb.DMatrix(train_data, label=target_data)
-
-        model_params = params if params is not None else {
-            "objective": "binary:logistic",
-            "eval_metric": "logloss",
-            "max_depth": 3,
-            "learning_rate": 0.1,
-            "n_estimators": 100,
-        }
 
         bst = xgb.train(params, dtrain)
         print("XGBoost model trained successfully!")
         return bst
 
-    def evaluate_xgboost_model(self, model, df_eval: pl.DataFrame) -> dict[str, float]:
+    def evaluate_xgboost_model(self, model, data_val: pl.DataFrame) -> dict[str, float]:
         """
         Evaluate a trained XGBoost booster on the provided dataframe using log loss and accuracy.
         """
-        features = df_eval.drop("is_cheating")
-        labels = df_eval["is_cheating"]
+        features = data_val.drop("is_cheating")
+        labels = data_val["is_cheating"]
 
         deval = xgb.DMatrix(features, label=labels)
         eval_result = model.eval(deval, name="eval")

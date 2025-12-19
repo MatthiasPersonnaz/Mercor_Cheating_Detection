@@ -12,6 +12,8 @@ from networkx.drawing.nx_agraph import graphviz_layout
 from polars import DataFrame
 import scipy
 from sklearn.manifold import SpectralEmbedding
+import tqdm
+from itertools import combinations
 
 class SocialGraph:
     def __init__(self, source_file: str):
@@ -22,7 +24,9 @@ class SocialGraph:
         self.candidate_ids: set[int] = set()
         self.df_edges: pl.DataFrame = pl.DataFrame()
 
-    def build(self, limit: int = 0):
+    def build(
+            self, limit: Optional[int] = None, database_nodes_subset: Optional[set[int]] = None
+    ):
         df_edges = pl.read_csv(
             self.source_file, n_rows=limit, n_threads=4, use_pyarrow=True
         )
@@ -41,13 +45,54 @@ class SocialGraph:
             )
         ).rename({"user_a": "ID_A", "user_b": "ID_B"})
 
-        self.graph = nx.from_pandas_edgelist(
+        graph = nx.from_pandas_edgelist(
             df_edges,
             source="ID_A",
             target="ID_B",
             create_using=nx.Graph(),
         )
+        print("Graph loaded successfully")
+        print("Number of nodes:", len(graph.nodes()))
+        print("Number of edges:", len(graph.edges()))
 
+        # contract here
+        if database_nodes_subset is not None:
+            print("Beginning pruning...")
+            nodes_to_keep = set(graph.nodes()).intersection(database_nodes_subset)
+
+            contracted_graph = nx.Graph()
+            contracted_graph.add_nodes_from(nodes_to_keep)
+            connected_components = nx.connected_components(graph)
+            for idx, component in enumerate(connected_components):
+                comp_nodes = nodes_to_keep.intersection(component)
+                if len(comp_nodes) <= 2:
+                    continue
+
+                subgraph = graph.subgraph(component)
+
+                # multi-source BFS from each kept node, restricted to component
+                # visited = set()
+                #
+                lengths_generator = nx.all_pairs_shortest_path_length(subgraph, backend="cugraph")
+
+                keep = nodes_to_keep  # already a set
+                add_edge = contracted_graph.add_edge
+
+                for u, dist_dict in tqdm.tqdm(lengths_generator):
+                    if u not in keep:
+                        continue
+
+                    # local bindings (critical for speed)
+                    u_local = u
+                    for v, d in dist_dict.items():
+                        if v in keep and v > u_local:
+                            add_edge(u_local, v, weight=d)
+                # print(f"There are {len(edges)} edges in component {idx} of size {len(comp_nodes)}")
+
+                contracted_graph.add_edges_from()
+                graph = contracted_graph
+
+        self.graph = graph
         self.df_edges = df_edges
         self.candidate_ids.update(self.graph.nodes())
         self.communities = [c for c in sorted(nx.connected_components(self.graph), key=len, reverse=True)]
@@ -55,18 +100,23 @@ class SocialGraph:
         print(
             f"Successfully built & validated social graph with {len(self.graph.nodes)} nodes."
         )
+
     def get_subgraph_view(self, comm_idx: int):
         return nx.induced_subgraph(self.graph, self.communities[comm_idx])
 
-    def plot_subgraph_view(self, comm_idx: int, candidate_dataset: DataFrame):
+    def plot_subgraph_view_(self, comm_idx: int, candidate_dataset: DataFrame):
         subgraph = self.get_subgraph_view(comm_idx)
         pos = graphviz_layout(subgraph, prog="sfdp")  # dot, neato, fdp, sfdp, twopi
         nx.draw(subgraph, pos, with_labels=False, node_size=20, font_size=10)
         plt.show()
 
+    def get_attributes_relationship_matrices(
+            self, subgraph: nx.Graph, dataset: DataFrame
+    ) -> Tuple[Any, Any]:
+        # Implement a method that computes attribute-based relationship matrices
+        return None, None
 
-    def get_adj_lapl_mat(self, community_idx: int) -> Tuple[np.ndarray]:
-        subgraph = self.get_subgraph_view(community_idx)
+    def get_graph_relationship_matrices(self, subgraph: nx.Graph) -> Tuple[Any, Any]:
         adj_mat = nx.to_scipy_sparse_array(
             subgraph, nodelist=subgraph.nodes, dtype=float
         ).tocsr()
@@ -74,8 +124,8 @@ class SocialGraph:
 
         return adj_mat, lapl_mat
 
-    def get_spectral_embeddings(self, community_idx: int, n_components: int):
-        adj_mat, lapl_mat = self.get_adj_lapl_mat(community_idx)
+    def get_spectral_embeddings(self, subgraph: nx.Graph, n_components: int):
+        adj_mat, _ = self.get_graph_relationship_matrices(subgraph)
         spectral_embedder = SpectralEmbedding(
             n_components=n_components,
             affinity="precomputed",  # to use our similarity_matrix
@@ -86,9 +136,9 @@ class SocialGraph:
         embeddings = spectral_embedder.fit_transform(adj_mat.toarray())
         return embeddings
 
-
-
-    def plot_subgraph_view(self, community_idx: int, dataset_train: DataFrame, dataset_test: DataFrame):
+    def plot_subgraph_view_by_datasets(
+            self, community_idx: int, dataset_train: DataFrame, dataset_test: DataFrame
+    ):
         subgraph = self.get_subgraph_view(community_idx)
         pos = graphviz_layout(subgraph, prog="sfdp")  # dot, neato, fdp, sfdp, twopi
 
@@ -110,25 +160,34 @@ class SocialGraph:
                     is_cheating = found_in_train["is_cheating"][0]
 
                 # Set color based on cheating status
-                node_colors[node] = 'red' if is_cheating else 'green'
+                node_colors[node] = "red" if is_cheating else "green"
             elif not found_in_test.is_empty():
-                node_colors[node] = 'yellow'
+                node_colors[node] = "yellow"
             else:
                 # Node not found in candidate dataset
-                node_colors[node] = 'blue'
+                node_colors[node] = "blue"
 
         # Draw the graph with colored nodes
-        nx.draw(subgraph, pos, with_labels=False, node_size=20, font_size=10,
-                node_color=list(node_colors.values()))
+        nx.draw(
+            subgraph,
+            pos,
+            with_labels=False,
+            node_size=20,
+            font_size=10,
+            node_color=list(node_colors.values()),
+        )
         plt.show()
 
-    def plot_subgraph_view_spectral(self, community_idx: int):
+    def plot_subgraph_view_by_network(self, community_idx: int):
+        # TODO:
         subgraph = self.get_subgraph_view(community_idx)
         if subgraph.number_of_nodes() == 0:
             return
 
         pos = graphviz_layout(subgraph, prog="sfdp")
-        embeddings = np.asarray(self.get_spectral_embeddings(community_idx, 3))
+        embeddings = np.asarray(
+            self.get_spectral_embeddings(subgraph=subgraph, n_components=3)
+        )
         nodes = list(subgraph.nodes())
 
         # Normalize each embedding dimension so it can be interpreted as an RGB channel.
