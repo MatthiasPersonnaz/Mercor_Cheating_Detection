@@ -69,7 +69,7 @@ def generate_df_schema_from_metadata(
 
 
 
-class CandidateDataset:
+class CandidateDataFrame:
     def __init__(self, source_train: str, source_test: str, source_feature_data: str):
         assert os.path.isfile(source_train)
         assert os.path.isfile(source_test)
