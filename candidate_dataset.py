@@ -7,10 +7,13 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import polars.selectors as cs
+import torch
 import xgboost as xgb
 from pandera.polars import Check, Column, DataFrameSchema
+from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import train_test_split
-from social_graph import SocialGraph
+from social_graph import SocialNetwork
+import torch
 
 
 # TODO: Remove the parsing logic and adapt the feature_metadata_refined.json file to use proper hardcoded ranges
@@ -262,7 +265,8 @@ class CandidateDataset:
         )
         return df
 
-    def _enrich_features(self, ):
+    def _enrich_features(self, network: SocialNetwork):
+        # TODO: Enrich features using the graph with other indicators
         pass
 
     def build_pipeline(self, limit: Optional[int] = None, fill_missing: bool = False, encode_categorical: bool = False,
@@ -314,7 +318,7 @@ class CandidateDataset:
         self.candidate_ids.update(self.df_train["ID"].unique().to_list())
         self.candidate_ids.update(self.df_test["ID"].unique().to_list())
 
-    def compute_isolate_candidates_from_network(self, network: SocialGraph):
+    def compute_isolate_candidates_from_network(self, network: SocialNetwork):
         diff1 = self.candidate_ids.difference(network.node_ids)
         print(
             f"There are {len(diff1)} elements in the dataset which are not present in the network."
@@ -333,7 +337,7 @@ class CandidateDataset:
         Shuffle a dataframe deterministically and split it into train/test subsets.
         """
 
-        daata_train, data_val = train_test_split(
+        data_train, data_val = train_test_split(
             self.df_train,
             test_size=test_fraction,
             random_state=seed,
@@ -342,52 +346,57 @@ class CandidateDataset:
         )
 
         print(
-            f"Split dataframe into {daata_train.height} training and {data_val.height} validation entries."
+            f"Split dataframe into {data_train.height} training and {data_val.height} validation entries."
         )
 
-        return daata_train, data_val
+        return data_train, data_val
 
     def fit_xgboost_model(self, data_train: pl.DataFrame, params: dict) -> xgb.XGBModel:
-        train_data = data_train.drop("is_cheating")
-        target_data = data_train["is_cheating"]
+        """
+        Train an XGBoost booster on the curated dataframe.
+        Drops the same non-feature columns used during evaluation to keep shapes aligned.
+        """
+        drop_cols = [c for c in ["is_cheating", "high_conf_clean", "ID"] if c in data_train.columns]
+        features = data_train.drop(drop_cols)
+        labels = data_train["is_cheating"]
 
-        dtrain = xgb.DMatrix(train_data, label=target_data)
+        dtrain = xgb.DMatrix(features, label=labels)
 
-        bst = xgb.train(params, dtrain)
+        # Set a small sane default if the caller did not pass anything useful
+        train_params = params or {
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+            "eta": 0.1,
+            "max_depth": 6,
+        }
+
+        model = xgb.train(train_params, dtrain)
         print("XGBoost model trained successfully!")
-        return bst
+        return model
 
-    def evaluate_xgboost_model(self, model, data_val: pl.DataFrame) -> dict[str, float]:
+    def test_xgboost_model(self, model, data_val: pl.DataFrame) -> dict[str, float]:
         """
         Evaluate a trained XGBoost booster on the provided dataframe using log loss and accuracy.
+        Uses direct metric computation instead of parsing xgboost's string output.
         """
-        features = data_val.drop("is_cheating")
+        drop_cols = [c for c in ["is_cheating", "high_conf_clean", "ID"] if c in data_val.columns]
+        features = data_val.drop(drop_cols)
         labels = data_val["is_cheating"]
 
         deval = xgb.DMatrix(features, label=labels)
-        eval_result = model.eval(deval, name="eval")
-
-        metric_values: dict[str, float] = {}
-        for entry in eval_result.strip().split("\t"):
-            entry = entry.strip()
-            if not entry or entry.startswith("[") or ":" not in entry:
-                continue
-            metric, value = entry.split(":", 1)
-            try:
-                metric_values[metric] = float(value)
-            except ValueError:
-                continue
-
         preds = model.predict(deval)
         labels_np = labels.to_numpy()
-        accuracy = float(((preds >= 0.5) == labels_np).mean())
 
-        logloss = metric_values.get("eval-logloss")
-        if logloss is not None:
-            print(
-                f"Evaluation metrics -> LogLoss: {logloss:.5f}, Accuracy: {accuracy:.4f}"
-            )
-        else:
-            print(f"Evaluation metrics -> {eval_result}, Accuracy: {accuracy:.4f}")
+        eval_logloss = float(log_loss(labels_np, preds))
+        eval_accuracy = float(accuracy_score(labels_np, preds >= 0.5))
 
-        return {"logloss": logloss, "accuracy": accuracy, "raw_eval": eval_result}
+        print(f"Evaluation metrics -> LogLoss: {eval_logloss:.5f}, Accuracy: {eval_accuracy:.4f}")
+
+        return {"logloss": eval_logloss, "accuracy": eval_accuracy}
+
+    def sample_from_train(self, is_cheating: Optional[bool], n_samples: int) -> torch.Tensor:
+        return (self.df_train
+         .filter(pl.col("is_cheating") == is_cheating)
+         .select(pl.exclude("ID"))
+         .sample(n=n_samples, with_replacement=False)
+         .to_torch())

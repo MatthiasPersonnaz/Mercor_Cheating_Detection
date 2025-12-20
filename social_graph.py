@@ -28,7 +28,7 @@ def to_int32_sparse(mat):
     return mat
 
 
-class SocialGraph:
+class SocialNetwork:
     def __init__(self, source_file: str):
         self.communities: list[int] = []
         assert os.path.isfile(source_file)
@@ -167,7 +167,7 @@ class SocialGraph:
                 adj_mat = to_int32_sparse(adj_mat)
                 embeddings = spectral_embedder.fit_transform(adj_mat)
         if mode == "laplacian":
-            if len(subgraph) >= 50000:
+            if len(subgraph) >= 1000:
                 lapl_gpu = cupyx.scipy.sparse.csr_matrix(lapl_mat)
                 vals, vecs = cu_linalg.eigsh(lapl_gpu, k=n_components + 1, which="SA", tol=1e-6, maxiter=1000)
                 vals = cp.asnumpy(vals)
