@@ -315,11 +315,11 @@ class CandidateDataset:
         self.candidate_ids.update(self.df_test["ID"].unique().to_list())
 
     def compute_isolate_candidates_from_network(self, network: SocialGraph):
-        diff1 = self.candidate_ids.difference(network.candidate_ids)
+        diff1 = self.candidate_ids.difference(network.node_ids)
         print(
             f"There are {len(diff1)} elements in the dataset which are not present in the network."
         )
-        diff2 = network.candidate_ids.difference(self.candidate_ids)
+        diff2 = network.node_ids.difference(self.candidate_ids)
         print(
             f"There are {len(diff2)} elements in the network which are not present in the dataset."
         )
