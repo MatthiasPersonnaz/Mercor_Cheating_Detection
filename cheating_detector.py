@@ -14,19 +14,21 @@ class Projector(nn.Module):
 
         self.projector = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, features: torch.Tensor):
-        return self.projector(features)
+        logits = self.projector(features)
+        logits = torch.clamp(logits, min=-2.0, max=2.0)
+        return logits
 
 
 class CheatingDetector:
@@ -50,10 +52,10 @@ class CheatingDetector:
         """
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = self.classifier.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
         # Increase penalty on false negatives to address class imbalance (cheaters are rare).
         weight_tensor = torch.tensor([pos_weight], dtype=torch.float32).to(device) if pos_weight is not None else None
-        criterion = nn.BCEWithLogitsLoss(pos_weight=weight_tensor)
+        bce_loss = nn.BCEWithLogitsLoss(pos_weight=weight_tensor)
 
         for epoch in range(epochs):
             model.train()
@@ -63,11 +65,12 @@ class CheatingDetector:
 
             for features, labels in tqdm.tqdm(dataloader):
                 features = features.to(device)
-                targets = labels[:, 0].float().to(device)  # use is_cheating only, ignore high_conf_clean
+                targets = labels[:, 0].float().to(device)  # is_cheating
+                high_conf_clean = labels[:,1].float().to(device) # high_conf_clean
 
                 optimizer.zero_grad()
                 logits = model(features)[:, 0]
-                loss = criterion(logits, targets)
+                loss = bce_loss(logits, targets) + .1 * (torch.exp(logits) * high_conf_clean).mean()
                 loss.backward()
                 optimizer.step()
 

@@ -397,6 +397,6 @@ class CandidateDataFrame:
     def sample_from_train(self, is_cheating: Optional[bool], n_samples: int) -> torch.Tensor:
         return (self.df_train
          .filter(pl.col("is_cheating") == is_cheating)
-         .select(pl.exclude("ID"))
+         .select(pl.exclude(["ID", "is_cheating", "high_conf_clean"]))
          .sample(n=n_samples, with_replacement=False)
          .to_torch())
