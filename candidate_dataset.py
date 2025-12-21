@@ -1,8 +1,11 @@
 import json
+import math
 import os
 import re
+from collections import Counter
 from typing import Any, Optional, Tuple
 
+import networkx as nx
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -14,6 +17,7 @@ from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import train_test_split
 from social_graph import SocialNetwork
 import torch
+import tqdm
 
 
 # TODO: Remove the parsing logic and adapt the feature_metadata_refined.json file to use proper hardcoded ranges
@@ -85,7 +89,7 @@ class CandidateDataFrame:
         self.df_validation: pl.DataFrame = pl.DataFrame()
         with open(self.source_feature_map) as f:
             self.feature_metadata: dict[str, dict[str, Any]] = json.load(f)
-        self.schema: DataFrameSchema = generate_df_schema_from_metadata(self.feature_metadata)
+        self.import_schema: DataFrameSchema = generate_df_schema_from_metadata(self.feature_metadata)
 
         print(
             "Successfully instanciated Candidate Dataset and imported feature metadata."
@@ -138,7 +142,7 @@ class CandidateDataFrame:
             row_index_name=None,
         )
 
-        self.schema.validate(dataframe)
+        self.import_schema.validate(dataframe)
 
         return dataframe
 
@@ -176,7 +180,7 @@ class CandidateDataFrame:
         )
         return df
 
-    def _handle_missing_values(self, df: pl.DataFrame) -> pl.DataFrame:
+    def _handle_missing_labels(self, df: pl.DataFrame) -> pl.DataFrame:
         # handle is_cheating case based on the high_conf_clean column ONLY IN TRAINING SET
         if "is_cheating" in df.columns:
             df = df.with_columns(
@@ -194,15 +198,102 @@ class CandidateDataFrame:
                 pl.col("high_conf_clean")
                 .fill_null(pl.lit(False))
             )
+        return df
 
-        # TODO: Add some mechanism to guess the missing values from the graph for the other columns
-
+    def _guess_missing_features(self, df: pl.DataFrame, social_graph: Optional[nx.Graph]) -> pl.DataFrame:
+        # fill the missing data with social relationships
         boolean_cols = (self.get_columns_of_target_type(df, "boolean")
                         .difference({"high_conf_clean", "is_cheating"})) # remove the formerly already handled
         categorical_cols = self.get_columns_of_target_type(df, "categorical")
         integer_cols = self.get_columns_of_target_type(df, "integer")
         float_cols = self.get_columns_of_target_type(df, "float")
 
+        # Some mechanism to guess the missing values from the graph
+        # for every point of data of id given by golumn "ID" in the dataframe df,
+        # # check if it has missing values in all columns except "is_cheating" and "is_missing" if applicable,
+        # then fetch its neighbors in the social graph
+        # and fill the missing values of the datapoint
+        #   with the average of its neighbors' values if it is numerical
+        #   or by voting if it is boolean or categorical
+        # keep track of the completions and display a message summarizing the number of successful completions performed
+
+        completions = 0
+        if social_graph is None:
+            print(f"No completion entries with graph-based imputation were made.")
+            return df
+        else:
+            print(f"Starting completion process with provided graph of {len(social_graph)} nodes...")
+
+        passed_df_schema = df.schema # save for later reuse when saving the attributions
+        df_dict = df.to_dict(as_series=False)
+        id_list = df_dict.get("ID", [])
+        id_to_row: dict[int, int] = {node_id: idx for idx, node_id in enumerate(id_list)}
+        excluded_cols = {"ID", "is_cheating", "high_conf_clean"}
+        if "is_missing" in df.columns:
+            excluded_cols.add("is_missing")
+        cols_to_guess = [col for col in df.columns if col not in excluded_cols]
+
+        def is_missing(value: Any) -> bool:
+            return value is None or (isinstance(value, float) and math.isnan(value))
+
+        for row_idx, node_id in tqdm.tqdm(enumerate(id_list)):
+            if node_id not in social_graph:
+                continue
+
+            missing_cols: list[str] = [
+                col for col in cols_to_guess if is_missing(df_dict[col][row_idx])
+            ]
+            if not missing_cols:
+                continue
+
+            neighbor_indices: list[int] = [
+                id_to_row[neighbor]
+                for neighbor in social_graph.neighbors(node_id)
+                if neighbor in id_to_row
+            ]
+            if not neighbor_indices:
+                continue
+
+            filled_any = False
+            for col in missing_cols:
+                neighbor_values = [
+                    df_dict[col][n_idx]
+                    for n_idx in neighbor_indices
+                    if not is_missing(df_dict[col][n_idx])
+                ]
+                if not neighbor_values:
+                    continue
+
+                if col in boolean_cols:
+                    vote = Counter(neighbor_values).most_common(1)[0][0]
+                    df_dict[col][row_idx] = bool(vote)
+                    filled_any = True
+                elif col in categorical_cols:
+                    vote = Counter(neighbor_values).most_common(1)[0][0]
+                    df_dict[col][row_idx] = str(vote)
+                    filled_any = True
+                elif col in integer_cols:
+                    df_dict[col][row_idx] = int(round(float(np.mean(neighbor_values))))
+                    filled_any = True
+                elif col in float_cols:
+                    df_dict[col][row_idx] = float(np.mean(neighbor_values))
+                    filled_any = True
+
+            if filled_any:
+                completions += 1
+
+        df = pl.DataFrame(df_dict, schema=passed_df_schema)
+        print(f"Detected {completions} entries with graph-based imputation.")
+        return df
+
+    def _fill_missing_features(self, df: pl.DataFrame) -> pl.DataFrame:
+        boolean_cols = (self.get_columns_of_target_type(df, "boolean")
+                        .difference({"high_conf_clean", "is_cheating"})) # remove the formerly already handled
+        categorical_cols = self.get_columns_of_target_type(df, "categorical")
+        integer_cols = self.get_columns_of_target_type(df, "integer")
+        float_cols = self.get_columns_of_target_type(df, "float")
+
+        # fill the remaining missing data with heuristics or dummy min, mean or missing thereafter
         missing_indicator_exprs = [
             # categorical columns are handled thereafter in a special way
             pl.col(col).is_null().alias(f"{col}:missing")
@@ -216,8 +307,8 @@ class CandidateDataFrame:
         df = df.with_columns(
             pl.col(boolean_cols).fill_null(False),
             pl.col(categorical_cols).fill_null("missing"),
-            pl.col(integer_cols).fill_null(strategy="min"),
-            pl.col(float_cols).fill_null(strategy="min"),
+            pl.col(integer_cols).fill_null(strategy="mean"),
+            pl.col(float_cols).fill_null(strategy="mean"),
         )
         return df
 
@@ -270,7 +361,7 @@ class CandidateDataFrame:
         pass
 
     def build_pipeline(self, limit: Optional[int] = None, fill_missing: bool = False, encode_categorical: bool = False,
-                       normalize_cols: bool = False):
+                       normalize_cols: bool = False, guess_missing: bool = False, social_network: Optional[nx.Graph] = None):
 
         # Import and validate datasets
         df_train = self._import_and_validate_dataset(
@@ -279,29 +370,46 @@ class CandidateDataFrame:
         df_test = self._import_and_validate_dataset(
             self.source_test, limit=limit
         )
+        print(f"Loaded datasets (train: {df_train.height} rows, test: {df_test.height} rows).")
 
         # Transform user_hash to integer ID
         df_train = self._transform_user_hash_to_id(df_train)
         df_test = self._transform_user_hash_to_id(df_test)
+        print("Transformed user_hash to integer IDs.")
 
         # Cast columns to proper types and encode categorical features as dummies
         df_train = self._cast_columns(df_train)
         df_test = self._cast_columns(df_test)
+        print("Casted columns to target dtypes.")
 
-        # Handle missing values
+        # Handle missing labels
+        df_train = self._handle_missing_labels(df_train)
+        print("Handled missing labels in training set.")
+
+        # Guess missing features based on the graph data
+        if guess_missing:
+            # TODO: Later merge the dataframes to perform that step in order to avoid second-guessing test features
+            df_train = self._guess_missing_features(df_train, social_network)
+            df_test = self._guess_missing_features(df_test, social_network)
+            print("Guessed missing features using graph context.")
+
+        # Fill missing features
         if fill_missing:
-            df_train = self._handle_missing_values(df_train)
-            df_test = self._handle_missing_values(df_test)
+            df_train = self._fill_missing_features(df_train)
+            df_test = self._fill_missing_features(df_test)
+            print("Filled remaining missing features with defaults.")
 
         # Encode categorical features as dummies
         if encode_categorical:
             df_train = self._encode_dummies(df_train)
             df_test = self._encode_dummies(df_test)
+            print("Encoded categorical features.")
 
         if normalize_cols:
             train_stats_dict = self._compute_mean_std(df_train)
             df_train = self._normalize_columns(df_train, train_stats_dict)
             df_test = self._normalize_columns(df_test, train_stats_dict)
+            print("Normalized numerical columns using train statistics.")
 
         self.df_train = df_train
         self.df_test = df_test
