@@ -1,7 +1,7 @@
 [project]
 name = "mercor-cheating-detection"
 version = "0.1.0"
-description = "Add your description here"
+description = "Kaggle's Mercor Cheating Detection Challenge"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
